@@ -2,6 +2,7 @@
 #include <lvgl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <Wire.h>
 
 #include "Arduino_GFX_Library.h"
@@ -14,8 +15,7 @@
 #define EXAMPLE_LVGL_TICK_PERIOD_MS 2
 #define BATTERY_SYMBOL "\xEF\x97\x9F"
 #define WATER_SYMBOL "\xEF\x98\x94"
-#define TEST_MODE 1
-#define NEEDLE_DT 0.016f
+#define TEST_MODE 0
 #define DEBUG_LOG 1
 
 #define RXD1 43
@@ -56,11 +56,11 @@ void make_icons(void);
 void make_daily_screen(void);
 void create_dual_gauge(void);
 void create_green_masks(void);
-void update_water_temp(int new_water_temp);
+void update_water_temp(float new_water_temp);
 void update_battery_voltage(float new_val);
 void update_dual_gauge(float left_val, float right_val);
-void battery_needle_tick(void);
-void water_needle_tick(void);
+void battery_needle_tick(float dt);
+void water_needle_tick(float dt);
 void updateTestMode(void);
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p);
 void example_increase_lvgl_tick(void *arg);
@@ -80,22 +80,35 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf1[LCD_WIDTH * 40];
 static lv_color_t buf2[LCD_WIDTH * 40];
 
-GaugeData WaterData = {165, 0, 50, 130};
+GaugeData WaterData = {165, 0, 50, 150};
 GaugeData BatteryData = {-165, 0, 10, 16};
 
+// Needle animation state (in real units: volts / degC)
 static float current_battery_value = 0.0f;
 static float current_water_value = 0.0f;
-static int target_water_value = 0;
 static float target_battery_value = 0.0f;
-static float battery_velocity = 0.0f;
-static float water_velocity = 0.0f;
+static float target_water_value = 0.0f;
+
+// How fast the needle approaches its target (1/s). Higher = snappier.
+// Exponential approach: never overshoots, never rings.
+const float BATTERY_NEEDLE_RATE = 4.0f;
+const float WATER_NEEDLE_RATE = 3.0f;
+
+// Low-pass filter on raw OBD readings (0..1, applied once per sample at ~2 Hz).
+// 0.3 => time constant roughly 1.5 s. Lower = smoother but laggier.
+const float VOLTAGE_FILTER_ALPHA = 0.3f;
+const float TEMP_FILTER_ALPHA = 0.5f;
 
 bool ui_ready = false;
 
 unsigned long lastRequest = 0;
 const unsigned long requestInterval = 500;
-float voltage = 0.0f;
-float temperature = 0.0f;
+float voltage = 0.0f;          // raw, last parsed
+float temperature = 0.0f;      // raw, last parsed
+float voltage_filt = 0.0f;     // filtered, what the gauge shows
+float temperature_filt = 0.0f; // filtered, what the gauge shows
+bool voltage_valid = false;
+bool temperature_valid = false;
 
 float testVoltage = BatteryData.min;
 float testTemperature = WaterData.min;
@@ -133,17 +146,21 @@ int NEEDLE_WIDTH = 5;
 int NEEDLE_OFFSET = -10;
 lv_color_t NEEDLE_COLOR = LV_COLOR_MAKE(255, 0, 0);
 int HALF_METER_TICKS = 5;
+
+// Labelled scale uses BATTERY_SCALE (100..160 so labels read 10..16 after masking).
+// The needle rides on a separate, invisible scale that is NEEDLE_FINE times finer,
+// so one needle step is 0.15 deg instead of 1.5 deg.
 const int BATTERY_SCALE = 10;
+const int NEEDLE_FINE = 10;
+
 const int SPLASH_FADE_MS = 300;
 const int SPLASH_MIN_MS = 3000;
-const int OBD_REQUEST_GAP_MS = 50;
 const int OBD_BUFFER_SIZE = 96;
+const unsigned long OBD_RESPONSE_TIMEOUT_MS = 400;
 
 char obdBuffer[OBD_BUFFER_SIZE];
 int obdBufferPos = 0;
 bool transition_started = false;
-bool obd_voltage_pending = false;
-unsigned long obd_voltage_due = 0;
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
   LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1,
@@ -164,7 +181,17 @@ enum BootState {
   BOOT_DONE
 };
 
+// OBD polling is a strict request -> wait for '>' -> next request sequence.
+// Never send a new command while the ELM327 is still answering the previous one.
+enum ObdState {
+  OBD_IDLE,
+  OBD_WAIT_TEMP,
+  OBD_WAIT_VOLT
+};
+
 BootState boot_state = BOOT_SPLASH;
+ObdState obd_state = OBD_IDLE;
+unsigned long obd_sent_at = 0;
 unsigned long splash_start_time = 0;
 int elm_step = 0;
 
@@ -179,6 +206,7 @@ void make_meter(const MeterConfig *config) {
   lv_obj_set_style_text_font(meter, &lv_font_montserrat_24, LV_PART_TICKS);
   lv_obj_set_style_text_color(meter, PALETTE_WHITE, LV_PART_TICKS);
 
+  // Visible scale: ticks + labels + outline arc
   lv_meter_scale_t *scale = lv_meter_add_scale(meter);
   lv_meter_set_scale_ticks(meter, scale, HALF_METER_TICKS, TICK_WIDTH, TICK_LENGTH, PALETTE_WHITE);
   lv_meter_set_scale_major_ticks(meter, scale, HALF_METER_TICKS - 1, TICK_WIDTH, TICK_LENGTH, PALETTE_WHITE, TICK_TEXT_OFFSET);
@@ -188,7 +216,15 @@ void make_meter(const MeterConfig *config) {
   lv_meter_set_indicator_start_value(meter, outline, config->scale_min);
   lv_meter_set_indicator_end_value(meter, outline, config->scale_max);
 
-  *config->indicator = lv_meter_add_needle_line(meter, scale, NEEDLE_WIDTH, NEEDLE_COLOR, NEEDLE_OFFSET);
+  // Invisible fine scale for the needle: same geometry, NEEDLE_FINE x the range, no ticks
+  lv_meter_scale_t *fine = lv_meter_add_scale(meter);
+  lv_meter_set_scale_ticks(meter, fine, 0, 0, 0, PALETTE_WHITE);
+  lv_meter_set_scale_range(meter, fine,
+                           config->scale_min * NEEDLE_FINE,
+                           config->scale_max * NEEDLE_FINE,
+                           config->angle_range, config->rotation);
+
+  *config->indicator = lv_meter_add_needle_line(meter, fine, NEEDLE_WIDTH, NEEDLE_COLOR, NEEDLE_OFFSET);
 }
 
 void make_left_meter(void) {
@@ -252,22 +288,14 @@ void create_dual_gauge(void) {
   make_daily_screen();
 }
 
-void update_water_temp(int new_water_temp) {
-  // if (new_water_temp == -1 || new_water_temp == target_water_value) {
-  //   return;
-  // }
-
-  target_water_value = new_water_temp;
-  lv_obj_invalidate(water_meter);
+// Targets only. No invalidate here: lv_meter_set_indicator_value does that,
+// and only when the needle actually moves.
+void update_water_temp(float new_water_temp) {
+  target_water_value = constrain(new_water_temp, (float)WaterData.min, (float)WaterData.max);
 }
 
 void update_battery_voltage(float new_val) {
-  // if (new_val == -1 || new_val == target_battery_value) {
-  //   return;
-  // } ///HERE!!!
-
-  target_battery_value = new_val;
-  lv_obj_invalidate(oil_meter);
+  target_battery_value = constrain(new_val, (float)BatteryData.min, (float)BatteryData.max);
 }
 
 void update_dual_gauge(float left_val, float right_val) {
@@ -276,33 +304,39 @@ void update_dual_gauge(float left_val, float right_val) {
   }
 
   update_battery_voltage(left_val);
-  update_water_temp((int)right_val);
+  update_water_temp(right_val);
 }
 
-void battery_needle_tick(void) {
-    if (!ui_ready) return;
-
-    float force = (target_battery_value - current_battery_value) * 15.0f;
-    battery_velocity *= 0.82f;
-    battery_velocity += force * NEEDLE_DT;
-    current_battery_value += battery_velocity;
-
-    lv_meter_set_indicator_value(oil_meter, oil_indic,
-        (int)(current_battery_value * BATTERY_SCALE));
+// Exponential approach with real elapsed time: frame-rate independent, no overshoot.
+static inline float approach(float current, float target, float rate, float dt) {
+  float k = 1.0f - expf(-rate * dt);
+  return current + (target - current) * k;
 }
 
-void water_needle_tick(void) {
-  if (!ui_ready) {
-    return;
+void battery_needle_tick(float dt) {
+  if (!ui_ready) return;
+
+  current_battery_value = approach(current_battery_value, target_battery_value, BATTERY_NEEDLE_RATE, dt);
+
+  static int last_shown = INT32_MIN;
+  int shown = (int)lroundf(current_battery_value * BATTERY_SCALE * NEEDLE_FINE);
+  if (shown != last_shown) {
+    last_shown = shown;
+    lv_meter_set_indicator_value(oil_meter, oil_indic, shown);
   }
+}
 
-  float force = (target_water_value - current_water_value) * 12.0f;
-  water_velocity *= 0.85f;
-  water_velocity += force * NEEDLE_DT;
-  water_velocity = constrain(water_velocity, -50.0f, 50.0f);
-  current_water_value += water_velocity;
+void water_needle_tick(float dt) {
+  if (!ui_ready) return;
 
-  lv_meter_set_indicator_value(water_meter, water_indic, (int)current_water_value);
+  current_water_value = approach(current_water_value, target_water_value, WATER_NEEDLE_RATE, dt);
+
+  static int last_shown = INT32_MIN;
+  int shown = (int)lroundf(current_water_value * NEEDLE_FINE);
+  if (shown != last_shown) {
+    last_shown = shown;
+    lv_meter_set_indicator_value(water_meter, water_indic, shown);
+  }
 }
 
 void updateTestMode(void) {
@@ -318,11 +352,11 @@ void updateTestMode(void) {
     testVoltage -= voltageStep;
   }
 
+  // Simulate alternator-style noise so the bench exercises the same path as the car
+  testVoltage += random(-5, 6) * 0.01f;
   if (random(0, 20) == 0) {
     testVoltage += random(-10, 20) * 0.1f;
   }
-
-  testVoltage = 13;
 
   if (testVoltage >= BatteryData.max) {
     testVoltage = BatteryData.max;
@@ -332,7 +366,7 @@ void updateTestMode(void) {
     voltageIncreasing = true;
   }
 
-  testVoltage = constrain(testVoltage, BatteryData.min, BatteryData.max);
+  testVoltage = constrain(testVoltage, (float)BatteryData.min, (float)BatteryData.max);
 
   if (temperatureIncreasing) {
     testTemperature += temperatureStep;
@@ -355,11 +389,16 @@ void updateTestMode(void) {
     temperatureIncreasing = true;
   }
 
-  testTemperature = constrain(testTemperature, WaterData.min, WaterData.max);
-  update_dual_gauge(testVoltage, testTemperature);
+  testTemperature = constrain(testTemperature, (float)WaterData.min, (float)WaterData.max);
+
+  // Run the test values through the same filter the OBD path uses
+  if (!voltage_valid) { voltage_filt = testVoltage; voltage_valid = true; }
+  if (!temperature_valid) { temperature_filt = testTemperature; temperature_valid = true; }
+  voltage_filt += (testVoltage - voltage_filt) * VOLTAGE_FILTER_ALPHA;
+  temperature_filt += (testTemperature - temperature_filt) * TEMP_FILTER_ALPHA;
+
+  update_dual_gauge(voltage_filt, temperature_filt);
 }
-
-
 
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
   uint32_t w = area->x2 - area->x1 + 1;
@@ -374,6 +413,16 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
   lv_disp_flush_ready(disp);
 }
 
+// CO5300 requires partial-update windows aligned to even start / odd end
+// coordinates in both axes. Unaligned windows produce sheared ("italic") output.
+void my_disp_rounder(lv_disp_drv_t *disp, lv_area_t *area) {
+  (void)disp;
+  area->x1 &= ~1;
+  area->y1 &= ~1;
+  area->x2 |= 1;
+  area->y2 |= 1;
+}
+
 void example_increase_lvgl_tick(void *arg) {
   (void)arg;
   lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS);
@@ -386,25 +435,12 @@ void show_splash(void) {
   lv_obj_set_style_bg_color(splash_screen, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(splash_screen, LV_OPA_COVER, 0);
 
-  DEBUG_PRINTLN("create image");
   splash_img = lv_img_create(splash_screen);
-
-  DEBUG_PRINTLN("set src");
   lv_img_set_src(splash_img, &splash_0);
-
-  DEBUG_PRINTLN("center");
   lv_obj_center(splash_img);
   lv_obj_set_pos(splash_img, 0, 0);
 
-  DEBUG_PRINT("W=");
-  DEBUG_PRINTLN(lv_obj_get_width(splash_img));
-  DEBUG_PRINT("H=");
-  DEBUG_PRINTLN(lv_obj_get_height(splash_img));
-
-  DEBUG_PRINTLN("load screen");
   lv_scr_load(splash_screen);
-  DEBUG_PRINTLN(lv_obj_get_child_cnt(splash_screen));
-  DEBUG_PRINTLN(lv_img_get_zoom(splash_img));
 
   lv_obj_set_style_opa(splash_img, LV_OPA_TRANSP, 0);
   lv_obj_fade_in(splash_img, 300, 0);
@@ -447,22 +483,9 @@ void handle_elm_init(void) {
 }
 
 void handle_obd_poll(void) {
-  DEBUG_PRINTLN("handle_obd_poll");
-
   unsigned long now = millis();
 
-  if (now - lastRequest > requestInterval && !obd_voltage_pending) {
-    lastRequest = now;
-    obd_voltage_due = now + OBD_REQUEST_GAP_MS;
-    obd_voltage_pending = true;
-    sendOBD("0105");
-  }
-
-  if (obd_voltage_pending && (long)(now - obd_voltage_due) >= 0) {
-    sendOBD("0142");
-    obd_voltage_pending = false;
-  }
-
+  // 1. Read whatever the ELM has sent; a '>' prompt means the response is complete.
   while (Serial1.available()) {
     char c = Serial1.read();
 
@@ -473,21 +496,49 @@ void handle_obd_poll(void) {
     if (c == '>') {
       obdBuffer[obdBufferPos] = '\0';
       parseOBDResponse(obdBuffer);
-      update_dual_gauge(voltage, temperature);
       obdBufferPos = 0;
+
+      // Prompt received -> ELM is free, advance the sequence
+      if (obd_state == OBD_WAIT_TEMP) {
+        sendOBD("0142");
+        obd_sent_at = now;
+        obd_state = OBD_WAIT_VOLT;
+      } else if (obd_state == OBD_WAIT_VOLT) {
+        obd_state = OBD_IDLE;
+      }
     }
   }
 
   if (obdBufferPos >= OBD_BUFFER_SIZE - 1) {
     obdBufferPos = 0;
   }
+
+  // 2. Timeout guard: if the adapter never answers, don't stay stuck forever.
+  if (obd_state != OBD_IDLE && now - obd_sent_at > OBD_RESPONSE_TIMEOUT_MS) {
+    DEBUG_PRINTLN("OBD timeout");
+    obd_state = OBD_IDLE;
+    obdBufferPos = 0;
+  }
+
+  // 3. Start a new poll cycle.
+  if (obd_state == OBD_IDLE && now - lastRequest > requestInterval) {
+    lastRequest = now;
+    sendOBD("0105");
+    obd_sent_at = now;
+    obd_state = OBD_WAIT_TEMP;
+  }
+
+  // 4. Push filtered values to the gauge targets.
+  if (voltage_valid && temperature_valid) {
+    update_dual_gauge(voltage_filt, temperature_filt);
+  }
 }
 
 void setup() {
   current_battery_value = (float)BatteryData.min;
   current_water_value = (float)WaterData.min;
-  target_water_value = WaterData.min;
-  target_battery_value = BatteryData.min;
+  target_water_value = (float)WaterData.min;
+  target_battery_value = (float)BatteryData.min;
 
   Serial.begin(9600); // debug
   Serial1.begin(38400, SERIAL_8N1, 18, 17);
@@ -506,6 +557,7 @@ void setup() {
   disp_drv.hor_res = LCD_WIDTH;
   disp_drv.ver_res = LCD_HEIGHT;
   disp_drv.flush_cb = my_disp_flush;
+  disp_drv.rounder_cb = my_disp_rounder;
   disp_drv.draw_buf = &draw_buf;
   lv_disp_drv_register(&disp_drv);
 
@@ -531,80 +583,81 @@ void setup() {
 }
 
 void switch_screen_cb(lv_timer_t *t) {
-    lv_timer_del(t);
-    
-    // Nuke all animations
-    lv_anim_del_all();
-    
-    // Delete splash
-    if (splash_screen) {
-        lv_obj_del_async(splash_screen);
-        splash_screen = NULL;
-        splash_img = NULL;
-    }
+  lv_timer_del(t);
 
-    // Load gauge screen fully opaque, no tricks
-    lv_obj_set_style_opa(startup_scr, LV_OPA_COVER, 0);
-    lv_scr_load(startup_scr);
+  lv_anim_del_all();
 
-    ui_ready = true;
-    boot_state = BOOT_DONE;
+  if (splash_screen) {
+    lv_obj_del_async(splash_screen);
+    splash_screen = NULL;
+    splash_img = NULL;
+  }
+
+  lv_obj_set_style_opa(startup_scr, LV_OPA_COVER, 0);
+  lv_scr_load(startup_scr);
+
+  ui_ready = true;
+  boot_state = BOOT_DONE;
 }
 
 void transition_to_main_ui(void) {
-    if (transition_started) return;
-    transition_started = true;
+  if (transition_started) return;
+  transition_started = true;
 
-    create_dual_gauge();
+  create_dual_gauge();
 
-    lv_meter_set_indicator_value(oil_meter, oil_indic,
-        (int)(current_battery_value * BATTERY_SCALE));
-    lv_meter_set_indicator_value(water_meter, water_indic,
-        (int)current_water_value);
+  lv_meter_set_indicator_value(oil_meter, oil_indic,
+      (int)lroundf(current_battery_value * BATTERY_SCALE * NEEDLE_FINE));
+  lv_meter_set_indicator_value(water_meter, water_indic,
+      (int)lroundf(current_water_value * NEEDLE_FINE));
 
+  lv_obj_update_layout(startup_scr);
 
-    lv_obj_update_layout(startup_scr);
-
-    // Just wait SPLASH_FADE_MS then hard switch — no fade animations at all
-    lv_timer_create(switch_screen_cb, SPLASH_FADE_MS, NULL);
+  lv_timer_create(switch_screen_cb, SPLASH_FADE_MS, NULL);
 }
 
 void loop() {
-    lv_timer_handler();
+  static unsigned long last_tick_ms = 0;
 
-    switch (boot_state) {
-        case BOOT_SPLASH:
-            boot_state = BOOT_INIT;  // always go to INIT, even in TEST_MODE
-            break;
+  lv_timer_handler();
 
-        case BOOT_INIT:
-            #if TEST_MODE
-                boot_state = BOOT_READY;  // skip ELM init in test mode
-            #else
-                handle_elm_init();
-            #endif
-            break;
+  unsigned long now = millis();
+  float dt = (last_tick_ms == 0) ? 0.0f : (now - last_tick_ms) / 1000.0f;
+  last_tick_ms = now;
+  if (dt > 0.1f) dt = 0.1f; // clamp after long stalls (e.g. screen transition)
 
-        case BOOT_READY:
-            if (millis() - splash_start_time > SPLASH_MIN_MS) {
-                transition_to_main_ui();
-                boot_state = BOOT_SPLASH;  // park here while timer runs
-            }
-            break;
+  switch (boot_state) {
+    case BOOT_SPLASH:
+      boot_state = BOOT_INIT;
+      break;
 
-        case BOOT_DONE:
-            #if TEST_MODE
-                updateTestMode();
-            #else
-                handle_obd_poll();
-            #endif
-            water_needle_tick();
-            battery_needle_tick();
-            break;
-    }
+    case BOOT_INIT:
+#if TEST_MODE
+      boot_state = BOOT_READY;
+#else
+      handle_elm_init();
+#endif
+      break;
 
-    update_dual_gauge(voltage, temperature);
-    delay(1);
+    case BOOT_READY:
+      if (millis() - splash_start_time > SPLASH_MIN_MS) {
+        transition_to_main_ui();
+        boot_state = BOOT_SPLASH; // park here while timer runs
+      }
+      break;
+
+    case BOOT_DONE:
+#if TEST_MODE
+      updateTestMode();
+#else
+      handle_obd_poll();
+#endif
+      water_needle_tick(dt);
+      battery_needle_tick(dt);
+      break;
+  }
+
+  delay(1);
 }
 
 void sendELM(const char *cmd) {
@@ -616,7 +669,6 @@ void sendELM(const char *cmd) {
 
 void sendOBD(const char *pid) {
   DEBUG_PRINTLN(pid);
-
   Serial1.print(pid);
   Serial1.print("\r");
 }
@@ -627,32 +679,55 @@ void parseOBDResponse(const char *resp) {
 
   for (int i = 0; resp[i] != '\0' && clean_pos < OBD_BUFFER_SIZE - 1; i++) {
     char c = resp[i];
-
     if (c != ' ' && c != '\r' && c != '\n' && c != '>') {
       clean[clean_pos++] = c;
     }
   }
-
   clean[clean_pos] = '\0';
 
+  // Coolant temperature: 41 05 A  -> A - 40
   char *coolant = strstr(clean, "4105");
   if (coolant && strlen(coolant) >= 6) {
     char hexVal[] = {coolant[4], coolant[5], '\0'};
     int A = strtol(hexVal, NULL, 16);
-    temperature = A - 40;
+    float t = (float)(A - 40);
+
+    if (t > -40.0f && t < 215.0f) {
+      temperature = t;
+      if (!temperature_valid) {
+        temperature_filt = t;
+        temperature_valid = true;
+      } else {
+        temperature_filt += (t - temperature_filt) * TEMP_FILTER_ALPHA;
+      }
+    }
   }
 
-char *module_voltage = strstr(clean, "4142");
-if (module_voltage && strlen(module_voltage) >= 8) {
+  // Control module voltage: 41 42 A B -> (256*A + B) / 1000
+  char *module_voltage = strstr(clean, "4142");
+  if (module_voltage && strlen(module_voltage) >= 8) {
     char hexVal1[] = {module_voltage[4], module_voltage[5], '\0'};
     char hexVal2[] = {module_voltage[6], module_voltage[7], '\0'};
 
     int A = strtol(hexVal1, NULL, 16);
     int B = strtol(hexVal2, NULL, 16);
+    float v = (256 * A + B) / 1000.0f;
 
-    voltage = (256 * A + B) / 1000.0;
+    // Reject garbage (partial/garbled frames)
+    if (v > 5.0f && v < 20.0f) {
+      voltage = v;
+      if (!voltage_valid) {
+        voltage_filt = v;
+        voltage_valid = true;
+      } else {
+        voltage_filt += (v - voltage_filt) * VOLTAGE_FILTER_ALPHA;
+      }
+    }
 
-    DEBUG_PRINTLN(clean);      // 414224CC
-    DEBUG_PRINTLN(voltage);    // 9.42
-}
+    DEBUG_PRINT(clean);
+    DEBUG_PRINT("  raw=");
+    DEBUG_PRINT(v);
+    DEBUG_PRINT("  filt=");
+    DEBUG_PRINTLN(voltage_filt);
+  }
 }
